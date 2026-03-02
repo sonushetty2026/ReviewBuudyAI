@@ -6,3 +6,7 @@ rich>=13.0.0
 jsonlines>=4.0.0
 matplotlib>=3.7.0
 pytest>=7.4.0
+
+# AI layer
+anthropic>=0.40.0         # Claude LLM API (set ANTHROPIC_API_KEY env var)
+scikit-learn>=1.4.0       # Gradient Boosting ML scorer
