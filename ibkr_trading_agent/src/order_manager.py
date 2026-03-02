@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
 
-from ib_insync import IB, Contract, Fill, LimitOrder, MarketOrder, StopOrder, Trade
+from ib_async import IB, Contract, Fill, LimitOrder, MarketOrder, StopOrder, Trade
 
 from .config_loader import StrategyConfig
 from .risk_manager import RiskManager
@@ -109,7 +109,7 @@ class OrderManager:
 
         self._oca_counter: int = 0
 
-        # Wire up ib_insync callbacks
+        # Wire up ib_async callbacks
         self._ib.orderStatusEvent += self._on_order_status
         self._ib.execDetailsEvent += self._on_exec_details
 
@@ -347,7 +347,7 @@ class OrderManager:
             self._open_trades.clear()
             return
 
-        # Cancel all open orders via ib_insync
+        # Cancel all open orders via ib_async
         try:
             for trade in self._ib.openTrades():
                 try:
@@ -379,7 +379,7 @@ class OrderManager:
         self._open_trades.clear()
 
     # ------------------------------------------------------------------
-    # ib_insync callbacks
+    # ib_async callbacks
     # ------------------------------------------------------------------
 
     def _on_order_status(self, trade: Trade) -> None:
@@ -475,6 +475,16 @@ class OrderManager:
             if ot.exit_filled_qty >= ot.entry_filled_qty:
                 logger.info("Position fully closed: %s PnL=%.2f R=%.2f", sym, pnl, r_mult)
                 self._open_trades.pop(sym, None)
+
+                # If stopped out (stop leg filled or loss), ban symbol for rest of
+                # session to prevent immediate re-entry into the same failed setup
+                is_stop_fill = (
+                    ot.stop_trade is not None
+                    and oid == ot.stop_trade.order.orderId
+                )
+                if is_stop_fill or pnl < 0:
+                    self._risk.add_to_banlist(sym, f"stop_out_cooldown (pnl={pnl:.2f})")
+                    logger.info("Symbol %s banned after stop-out — preventing re-entry", sym)
 
     # ------------------------------------------------------------------
     # Utilities

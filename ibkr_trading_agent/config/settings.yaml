@@ -43,7 +43,7 @@ risk:
   consecutive_loss_limit: 3          # Stop after 3 losses in a row
 
   circuit_breaker:
-    data_feed_stale_sec: 30         # No quote update in this many seconds → trip
+    data_feed_stale_sec: 60         # No quote update in this many seconds → trip (60s for delayed data)
     order_reject_count: 3           # N rejects within the window → trip
     order_reject_window_sec: 300    # Rolling window for reject counting (5 min)
     order_latency_sec: 5.0          # Round-trip order latency threshold

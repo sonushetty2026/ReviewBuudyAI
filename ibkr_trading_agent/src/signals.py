@@ -259,12 +259,18 @@ class SignalGenerator:
 
     def _compute_stop_long(self, or_low: float, entry: float, atr: float) -> float:
         """Stop = tighter of OR low or entry - ATR."""
-        atr_stop = entry - atr
+        # Enforce minimum stop distance: at least 0.20% of entry price
+        min_risk = entry * 0.0020
+        effective_atr = max(atr, min_risk)
+        atr_stop = entry - effective_atr
         return max(or_low, atr_stop)   # max because we want the tighter (higher) stop
 
     def _compute_stop_short(self, or_high: float, entry: float, atr: float) -> float:
         """Stop = tighter of OR high or entry + ATR."""
-        atr_stop = entry + atr
+        # Enforce minimum stop distance: at least 0.20% of entry price
+        min_risk = entry * 0.0020
+        effective_atr = max(atr, min_risk)
+        atr_stop = entry + effective_atr
         return min(or_high, atr_stop)  # min because we want the tighter (lower) stop
 
     def _check_vwap_strength(self, dist_pct: float, strength: int, side: str) -> bool:

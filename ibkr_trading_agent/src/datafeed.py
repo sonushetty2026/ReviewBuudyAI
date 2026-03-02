@@ -1,7 +1,7 @@
 """
 Market data feed — OHLCV bars, VWAP, ATR, Opening Range tracking.
 
-DataFeed subscribes to ib_insync Tickers for each watchlist symbol and
+DataFeed subscribes to ib_async Tickers for each watchlist symbol and
 maintains per-symbol SymbolData objects that are updated on every tick.
 """
 
@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
 
-from ib_insync import IB, Contract, Ticker
+from ib_async import IB, Contract, Ticker
 
 from .config_loader import StrategyConfig
 
@@ -90,7 +90,7 @@ class DataFeed:
 
     Call order:
       feed.subscribe(symbols)
-      # ib_insync event loop runs → on_ticker_update fires automatically
+      # ib_async event loop runs → on_ticker_update fires automatically
       # On bar boundary: feed.finalize_bar(symbol, bar_ts)
       # At or_end_time:  feed.set_opening_range(symbol)
     """
@@ -102,7 +102,7 @@ class DataFeed:
         self._tickers: dict[str, Ticker] = {}
         self._contracts: dict[str, Contract] = {}
 
-        # Wire up the ib_insync pending-tickers event
+        # Wire up the ib_async pending-tickers event
         self._ib.pendingTickersEvent += self._on_pending_tickers
 
     def subscribe(self, symbols: list[str],
@@ -135,7 +135,7 @@ class DataFeed:
         self._tickers.clear()
 
     # ------------------------------------------------------------------
-    # Tick ingestion (called by ib_insync event loop)
+    # Tick ingestion (called by ib_async event loop)
     # ------------------------------------------------------------------
 
     def _on_pending_tickers(self, tickers: set) -> None:
@@ -302,6 +302,14 @@ class DataFeed:
         else:
             # Wilder's smoothing
             sd.atr = (sd.atr * (n - 1) + tr) / n
+
+        # Floor: ATR must be at least 0.15% of price to prevent micro-stops
+        # (delayed data compresses bar ranges → unrealistically small ATR)
+        price = bar.close if bar.close > 0 else bar.high
+        if price > 0:
+            atr_floor = price * 0.0015
+            if sd.atr < atr_floor:
+                sd.atr = atr_floor
 
     def _update_avg_volume(self, symbol: str) -> None:
         sd = self._data[symbol]

@@ -29,7 +29,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 from zoneinfo import ZoneInfo
 
-from ib_insync import IB, Stock
+from ib_async import IB, Stock
 
 from .broker import BrokerManager
 from .config_loader import AppConfig, load_config
@@ -324,6 +324,11 @@ class TradingAgent:
         last_pnl_snapshot = time.monotonic()
         pnl_snap_interval = 60  # seconds
 
+        trading_start_mono = time.monotonic()
+        # Grace period: skip stale-data checks for 120 s after entering TRADING
+        # so every delayed-data subscription has time to deliver its first quote.
+        _STALE_GRACE_SEC = 120
+
         while not self._shutdown_requested:
             now_tz = datetime.now(self._tz)
             now_mono = time.monotonic()
@@ -338,12 +343,13 @@ class TradingAgent:
                 await self._order_mgr.flatten_all("circuit_breaker")
                 break
 
-            # ---- Data staleness check ----
+            # ---- Data staleness check (skip during startup grace period) ----
             stale_threshold = self._cfg.risk.circuit_breaker.data_feed_stale_sec
-            for sym in self._cfg.watchlist.symbols:
-                if self._feed.is_stale(sym, stale_threshold):
-                    logger.warning("Data stale for %s", sym)
-                    self._risk.trip_circuit_breaker(f"data_feed_stale: {sym}")
+            if (now_mono - trading_start_mono) > _STALE_GRACE_SEC:
+                for sym in self._cfg.watchlist.symbols:
+                    if self._feed.is_stale(sym, stale_threshold):
+                        logger.warning("Data stale for %s", sym)
+                        self._risk.trip_circuit_breaker(f"data_feed_stale: {sym}")
 
             # ---- Finalize bars every N minutes ----
             if now_tz >= next_bar_time:
@@ -930,12 +936,9 @@ def main() -> None:
     agent = TradingAgent(cfg, dry_run_override=args.dry_run)
 
     # Handle signals for graceful shutdown
-    loop = asyncio.new_event_loop()
-
     def _handle_signal(*_):
         print("\nShutdown requested …")
         agent.request_shutdown()
-        loop.call_soon_threadsafe(loop.stop)
 
     try:
         signal.signal(signal.SIGINT, _handle_signal)
@@ -944,11 +947,9 @@ def main() -> None:
         pass  # Windows doesn't support all signals
 
     try:
-        loop.run_until_complete(agent.run())
+        asyncio.run(agent.run())
     except KeyboardInterrupt:
         print("\nKeyboardInterrupt — shutting down.")
-    finally:
-        loop.close()
 
 
 if __name__ == "__main__":

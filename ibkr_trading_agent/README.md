@@ -27,7 +27,7 @@ strict risk rails, full JSONL audit logs, and a bounded online learning pipeline
 
 ```
 main.py (asyncio scheduler)
-  ├── broker.py       — ib_insync connection, reconnect, circuit breaker
+  ├── broker.py       — ib_async connection, reconnect, circuit breaker
   ├── datafeed.py     — OHLCV bars, VWAP, ATR, Opening Range
   ├── signals.py      — ORB + VWAP + relative-strength signal generation
   ├── risk_manager.py — Central approval gate, daily PnL, all hard caps
@@ -59,7 +59,7 @@ pip install -r requirements.txt
 
 **Requirements:**
 ```
-ib_insync>=0.9.86
+ib_async>=0.9.86
 pandas>=2.0.0
 numpy>=1.24.0
 PyYAML>=6.0
@@ -252,7 +252,7 @@ ReviewBuudyAI/
 │   ├── config_loader.py        ← YAML → typed config
 │   ├── logger.py               ← Structured JSONL logging
 │   ├── storage.py              ← SQLite (runs/decisions/orders/fills/positions)
-│   ├── broker.py               ← ib_insync wrapper + circuit breaker
+│   ├── broker.py               ← ib_async wrapper + circuit breaker
 │   ├── datafeed.py             ← OHLCV bars, VWAP, ATR, Opening Range
 │   ├── risk_manager.py         ← Central risk gate + position sizing
 │   ├── signals.py              ← ORB + VWAP + RS signal generation
