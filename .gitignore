@@ -32,3 +32,15 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# Python trading agent runtime outputs
+data/
+logs/
+reports/
+learn_output/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.db
+*.jsonl
