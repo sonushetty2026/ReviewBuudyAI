@@ -1,0 +1,180 @@
+# ============================================================
+# IBKR Automated Trading Agent — Configuration
+# Account: DUN831500 (paper)  |  Size: $8,000
+#
+# Risk parameters are calibrated for an $8,000 account:
+#   max_daily_loss     = 2.0% of account  = $160
+#   max_loss_per_trade = 0.5% of account  = $40
+#   max_position_notional = 15% of account = $1,200
+#   max_concurrent_positions = 2
+#   max_trades_per_day = 8
+#
+# PAPER TRADING FIRST (default):  paper_only: true
+# GO LIVE WHEN READY:
+#   1. Set paper_only: false
+#   2. Set live_mode: true
+#   3. Change port to 7496 (TWS live) or 4001 (Gateway live)
+# ============================================================
+
+mode:
+  paper_only: true          # Hard guard — set false only for live trading
+  live_mode: false          # MUST be explicitly true (and paper_only false) to place live orders
+  dry_run: false            # Simulate orders in code, log decisions, never call broker
+
+broker:
+  host: "127.0.0.1"
+  # TWS paper=7497, TWS live=7496
+  # IB Gateway paper=4002, IB Gateway live=4001
+  port: 7497
+  client_id: 1
+  account: "DUN831500"      # Paper account ID (used for logging only; IB Gateway manages auth)
+  timeout_sec: 30
+  reconnect_attempts: 5
+  reconnect_backoff_sec: 2.0
+
+risk:
+  # $8,000 account — conservative calibration for first week of paper trading
+  account_size_usd: 8000.0
+  max_daily_loss_usd: 160.0          # 2% of $8,000 — flatten & stop for the day
+  max_loss_per_trade_usd: 40.0       # 0.5% of $8,000 — max risk per trade
+  max_trades_per_day: 8              # Cap entries per session
+  max_position_notional_usd: 1200.0  # ~15% of account — prevents over-concentration
+  max_concurrent_positions: 2        # Allow up to 2 simultaneous positions
+  consecutive_loss_limit: 3          # Stop after 3 losses in a row
+
+  circuit_breaker:
+    data_feed_stale_sec: 30         # No quote update in this many seconds → trip
+    order_reject_count: 3           # N rejects within the window → trip
+    order_reject_window_sec: 300    # Rolling window for reject counting (5 min)
+    order_latency_sec: 5.0          # Round-trip order latency threshold
+
+  spread_max_bps: 20.0              # Skip symbols with bid-ask spread > 20 bps
+
+strategy:
+  name: "ORB_VWAP"
+  allow_shorts: false               # Start long-only; set true to enable shorts
+  or_minutes: 5                     # Opening Range: first 5 minutes
+  vwap_filter_strength: 2           # 1=loose, 2=medium, 3=strict VWAP confirmation
+  atr_lookback: 14                  # Bars for Wilder's ATR
+  entry_limit_offset: 0.02          # $ above ask for buy limit (controls slippage cap)
+  stale_entry_cancel_sec: 60        # Cancel unfilled entry after 60 seconds
+  take_profit_r1: 1.5               # First partial exit at 1.5R
+  take_profit_r2: 2.0               # Final exit at 2.0R
+  partial_exit_pct_at_r1: 0.5       # Exit 50% at TP1
+  rs_lookback_bars: 3               # Bars for relative strength vs SPY
+  min_breakout_volume_ratio: 1.2    # Current bar volume >= 1.2× average to confirm breakout
+
+schedule:
+  timezone: "America/Los_Angeles"
+  prep_time: "06:15"            # Connect, load watchlist, subscribe data
+  market_open: "06:30"          # Regular session open (NYSE/NASDAQ)
+  or_end_time: "06:35"          # End of Opening Range window
+  trading_start: "06:35"        # Begin scanning for entries
+  trading_cutoff: "09:30"       # No new entries after this (avoid lunchtime)
+  eod_flatten_time: "09:45"     # Force-flatten all remaining positions
+
+watchlist:
+  always_include:
+    - "SPY"     # S&P 500 ETF (used as RS benchmark — always subscribed)
+    - "QQQ"     # Nasdaq 100
+    - "IWM"     # Russell 2000 small-cap
+    - "GLD"     # Gold ETF — risk-off asset
+    - "TLT"     # 20-year Treasury — risk-off / flight-to-safety
+    - "XLE"     # Energy sector
+    - "USO"     # Crude oil ETF
+    - "VXX"     # VIX short-term futures — volatility signal
+    - "LMT"     # Lockheed Martin — defense
+    - "RTX"     # Raytheon — defense/aerospace
+    - "NOC"     # Northrop Grumman
+    - "PLTR"    # Palantir — geopolitical AI
+    - "TSLA"    # High-beta tech
+    - "MSFT"    # Mega-cap tech
+    - "NVDA"    # AI/GPU — high beta
+    - "AAPL"    # Mega-cap
+    - "AMZN"    # Mega-cap tech/retail
+    - "GOOGL"   # Mega-cap tech
+    - "META"    # Mega-cap tech
+
+  # Additional liquid sector ETFs
+  sector_liquid:
+    - "XOP"     # Oil & gas E&P — high geopolitical beta
+    - "SOXX"    # Semiconductor ETF
+    - "SMH"     # VanEck semiconductor
+    - "XLF"     # Financial sector
+    - "HYG"     # High yield bonds — risk appetite proxy
+
+  # Energy majors
+  energy_majors:
+    - "XOM"     # ExxonMobil
+    - "CVX"     # Chevron
+    - "COP"     # ConocoPhillips
+    - "OXY"     # Occidental Petroleum
+    - "SLB"     # Schlumberger (oilfield services)
+    - "HAL"     # Halliburton
+    - "EOG"     # EOG Resources
+    - "MPC"     # Marathon Petroleum
+    - "VLO"     # Valero Energy
+
+  # Defense & aerospace
+  defense_aero:
+    - "GD"      # General Dynamics
+    - "LHX"     # L3Harris Technologies
+    - "TDG"     # TransDigm Group
+    - "AVAV"    # AeroVironment (drones)
+    - "BA"      # Boeing
+
+  # AI high-beta
+  ai_highbeta:
+    - "AMD"     # Advanced Micro Devices
+    - "INTC"    # Intel
+    - "SMCI"    # Super Micro Computer
+    - "ARM"     # ARM Holdings
+    - "SNOW"    # Snowflake
+    - "NOW"     # ServiceNow
+    - "CRM"     # Salesforce
+
+  # Flat extra list (populated from above at runtime via config_loader)
+  extra: []
+
+  filters:
+    min_price: 5.0              # Skip penny stocks
+    max_spread_bps: 20.0        # Skip illiquid names
+    min_premarket_volume: 50000 # 0 = skip filter if unavailable
+
+online_learning:
+  enabled: true
+  rolling_window: 5             # Evaluate over last N completed trades
+
+  position_size_multiplier:
+    min: 0.25
+    max: 1.0
+    default: 1.0
+
+  cooldown_minutes:
+    min: 0
+    max: 15
+    default: 0
+
+  vwap_filter_strength:
+    min: 1
+    max: 3
+
+  or_minutes:
+    min: 5
+    max: 15
+
+  # Thresholds that trigger intraday adjustments
+  win_rate_low_threshold: 0.30
+  slippage_high_bps: 30
+  vwap_reclaim_low_threshold: 0.40
+
+  # Ban thresholds
+  fake_breakout_ban_count: 2
+  slippage_ban_bps: 50
+  spread_ban_bps: 25
+
+paths:
+  db: "data/trading.db"
+  log_dir: "logs"
+  report_dir: "reports"
+  learn_dir: "learn_output"
