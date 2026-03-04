@@ -1,5 +1,5 @@
 """
-Broker connectivity — wraps ib_insync with reconnect logic and circuit breaker.
+Broker connectivity — wraps ib_async with reconnect logic and circuit breaker.
 
 Supports both TWS and IB Gateway. Handles:
   - Initial connection with exponential backoff retry
@@ -17,7 +17,7 @@ from collections import deque
 from datetime import datetime, timezone
 from typing import Optional
 
-from ib_insync import IB, Contract, ContractDetails, Stock, Ticker
+from ib_async import IB, Contract, ContractDetails, Stock, Ticker
 
 from .config_loader import BrokerConfig, CircuitBreakerConfig
 from .storage import ErrorRecord, Storage
@@ -76,7 +76,7 @@ class CircuitBreaker:
 
 class BrokerManager:
     """
-    Manages ib_insync connection lifecycle.
+    Manages ib_async connection lifecycle.
 
     Usage:
         bm = BrokerManager(config, storage)
@@ -94,7 +94,7 @@ class BrokerManager:
         self._reconnecting = False
         self._should_reconnect = True
 
-        # Register ib_insync event callbacks
+        # Register ib_async event callbacks
         self.ib.disconnectedEvent += self._on_disconnect
         self.ib.errorEvent += self._on_error
 
@@ -153,7 +153,18 @@ class BrokerManager:
     # ------------------------------------------------------------------
 
     async def _request_market_data_type(self) -> None:
-        """Try real-time first; fall back to delayed if subscription missing."""
+        """Try real-time first; fall back to delayed if subscription missing.
+
+        Paper trading ports (7497, 4002) typically lack real-time data
+        subscriptions, so we request delayed data (type 3) directly to
+        avoid error 10089 on every symbol.
+        """
+        paper_ports = {7497, 4002}
+        if self._cfg.port in paper_ports:
+            logger.info("Paper port %d detected — using DELAYED market data (type 3).", self._cfg.port)
+            self.ib.reqMarketDataType(3)
+            self._market_data_type = 3
+            return
         try:
             self.ib.reqMarketDataType(1)  # real-time
             await asyncio.sleep(0.2)
@@ -275,10 +286,16 @@ class BrokerManager:
             logger.debug("IBKR info [%d] %s (%s)", error_code, error_string, symbol)
             return
 
-        # Order rejects
-        if error_code in {201, 202, 110, 104}:
+        # Order rejects — only count genuine rejections, NOT cancels
+        # 201 = Order rejected by IB (price/margin/etc)
+        # 110 = Invalid price
+        # 104 = Can't modify a filled order
+        # 202 = Order Canceled — normal OCA bracket operation, NOT a reject
+        if error_code in {201, 110, 104}:
             logger.warning("Order rejected [%d] %s (%s)", error_code, error_string, symbol)
             self.circuit_breaker.record_order_reject()
+        elif error_code == 202:
+            logger.info("Order canceled [202] %s (%s) — not counted as reject", error_string, symbol)
         else:
             logger.error("IBKR error [%d] %s (%s)", error_code, error_string, symbol)
 

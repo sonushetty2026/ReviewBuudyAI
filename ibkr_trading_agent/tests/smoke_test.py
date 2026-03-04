@@ -34,9 +34,9 @@ async def run_smoke_test(
     Returns True on success, False on failure.
     """
     try:
-        from ib_insync import IB, Stock
+        from ib_async import IB, Stock
     except ImportError:
-        print("ERROR: ib_insync not installed. Run: pip install ib_insync")
+        print("ERROR: ib-async not installed. Run: pip install ib-async")
         return False
 
     ib = IB()

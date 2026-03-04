@@ -165,9 +165,10 @@ class RiskManager:
         dist = abs(price - stop)
         if dist <= 0:
             return False, "stop_distance_zero"
-        # Stop must be reasonable: at least $0.01, at most 10% of price
-        if dist < 0.01:
-            return False, f"stop_too_tight: {dist:.4f}"
+        # Stop must be reasonable: at least $0.05 or 0.10% of price, at most 10%
+        min_dist = max(0.05, price * 0.0010)
+        if dist < min_dist:
+            return False, f"stop_too_tight: {dist:.4f} (min={min_dist:.4f})"
         if dist > price * 0.10:
             return False, f"stop_too_wide: {dist:.4f} ({dist/price*100:.1f}%)"
         return True, ""

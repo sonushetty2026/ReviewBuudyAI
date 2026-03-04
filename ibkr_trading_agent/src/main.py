@@ -29,7 +29,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 from zoneinfo import ZoneInfo
 
-from ib_insync import IB, Stock
+from ib_async import IB, Stock
 
 from .broker import BrokerManager
 from .config_loader import AppConfig, load_config
@@ -44,6 +44,11 @@ from .signals import SignalGenerator
 from .storage import (
     DecisionRecord, ErrorRecord, PnlSnapshot, RunRecord, Storage,
 )
+
+# AI layer — optional, each component degrades gracefully if unavailable
+from .ai.llm_analyst import LLMAnalyst
+from .ai.ml_scorer import MLScorer
+from .ai.rl_sizer import RLSizer
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +117,48 @@ class TradingAgent:
 
         # Signal state for dashboard
         self._signal_states: dict[str, str] = {}
+
+        # ------------------------------------------------------------------
+        # AI layer — each component is optional; failures are logged and the
+        # agent falls back to the rule-based ORB system automatically.
+        # ------------------------------------------------------------------
+        self._llm: Optional[LLMAnalyst] = None
+        self._ml: Optional[MLScorer] = None
+        self._rl: Optional[RLSizer] = None
+
+        if cfg.ai.enabled:
+            # LLM analyst (requires ANTHROPIC_API_KEY env var)
+            if cfg.ai.llm_filter_enabled:
+                try:
+                    self._llm = LLMAnalyst(model=cfg.ai.llm_model)
+                except Exception as exc:
+                    logger.warning(
+                        "LLM analyst unavailable (%s) — running ORB-only mode", exc
+                    )
+
+            # ML signal scorer (requires scikit-learn)
+            if cfg.ai.ml_enabled:
+                try:
+                    self._ml = MLScorer(model_path=cfg.paths.ml_model)
+                    logger.info(
+                        "ML scorer ready (%d training samples)", self._ml.n_samples
+                    )
+                except Exception as exc:
+                    logger.warning("ML scorer unavailable: %s", exc)
+
+            # RL position sizer (pure Python, always available)
+            if cfg.ai.rl_sizing_enabled:
+                try:
+                    self._rl = RLSizer(q_table_path=cfg.paths.rl_qtable)
+                    logger.info("RL sizer ready: %s", self._rl.get_stats())
+                except Exception as exc:
+                    logger.warning("RL sizer unavailable: %s", exc)
+
+        # In-memory feature store: symbol → ML feature dict captured at signal time
+        # Used to train ML/RL after each trade closes
+        self._pending_features: dict[str, dict] = {}
+        # Track which position_ids have already been used for AI training
+        self._ai_trained_ids: set[str] = set()
 
     # ------------------------------------------------------------------
     # Main entry
@@ -277,6 +324,11 @@ class TradingAgent:
         last_pnl_snapshot = time.monotonic()
         pnl_snap_interval = 60  # seconds
 
+        trading_start_mono = time.monotonic()
+        # Grace period: skip stale-data checks for 120 s after entering TRADING
+        # so every delayed-data subscription has time to deliver its first quote.
+        _STALE_GRACE_SEC = 120
+
         while not self._shutdown_requested:
             now_tz = datetime.now(self._tz)
             now_mono = time.monotonic()
@@ -291,12 +343,13 @@ class TradingAgent:
                 await self._order_mgr.flatten_all("circuit_breaker")
                 break
 
-            # ---- Data staleness check ----
+            # ---- Data staleness check (skip during startup grace period) ----
             stale_threshold = self._cfg.risk.circuit_breaker.data_feed_stale_sec
-            for sym in self._cfg.watchlist.symbols:
-                if self._feed.is_stale(sym, stale_threshold):
-                    logger.warning("Data stale for %s", sym)
-                    self._risk.trip_circuit_breaker(f"data_feed_stale: {sym}")
+            if (now_mono - trading_start_mono) > _STALE_GRACE_SEC:
+                for sym in self._cfg.watchlist.symbols:
+                    if self._feed.is_stale(sym, stale_threshold):
+                        logger.warning("Data stale for %s", sym)
+                        self._risk.trip_circuit_breaker(f"data_feed_stale: {sym}")
 
             # ---- Finalize bars every N minutes ----
             if now_tz >= next_bar_time:
@@ -317,6 +370,9 @@ class TradingAgent:
                 for sym in self._contracts
             }
             await self._order_mgr.monitor(current_prices)
+
+            # ---- AI model updates (ML + RL learn from closed trades) ----
+            self._update_ai_models()
 
             # ---- PnL snapshots ----
             if now_mono - last_pnl_snapshot >= pnl_snap_interval:
@@ -400,10 +456,21 @@ class TradingAgent:
     # ------------------------------------------------------------------
 
     async def _scan_and_enter(self) -> None:
-        """Scan all symbols for signals and submit brackets if approved."""
+        """
+        Scan all symbols for signals and submit brackets if approved.
+
+        Pipeline (in order):
+          1. ORB rule engine  → candidate signals
+          2. ML scorer        → update sig.score with P(win); drop low-prob signals
+          3. Sort by score    → best ML-scored signals first
+          4. LLM analyst      → Claude confirms or vetos each signal
+          5. RL sizer         → choose position-size multiplier
+          6. Risk manager     → hard risk gates (unchanged)
+          7. Submit bracket
+        """
         live_params = self._ol.get_params()
         banned = set(live_params.symbol_banlist.keys())
-        symbols = [s for s in self._cfg.watchlist.symbols if s != "SPY"]  # SPY = benchmark only
+        symbols = [s for s in self._cfg.watchlist.symbols if s != "SPY"]
 
         signals = self._signals.scan_all(
             symbols,
@@ -412,39 +479,131 @@ class TradingAgent:
             banned_symbols=banned,
         )
 
-        # Sort by conviction score descending
+        # ── Step 2: ML scoring ──────────────────────────────────────────
+        if self._ml:
+            for sig in signals:
+                sd = self._feed.get(sig.symbol)
+                features = self._build_ml_features(sig, sd)
+                ml_score = self._ml.score(features)
+                sig.score = ml_score.win_probability  # replace simple heuristic score
+
+                if ml_score.active and ml_score.win_probability < self._cfg.ai.ml_min_probability:
+                    log_decision(
+                        self._app_logger,
+                        symbol=sig.symbol, action="SKIP",
+                        rationale=(
+                            f"ml_veto: P(win)={ml_score.win_probability:.2f} < "
+                            f"{self._cfg.ai.ml_min_probability} "
+                            f"(n={ml_score.n_samples}, top={ml_score.top_feature})"
+                        ),
+                        market_snapshot=sig.snapshot,
+                        risk_checks={"ml_active": True, "ml_prob": ml_score.win_probability},
+                    )
+                    signals = [s for s in signals if s.symbol != sig.symbol]
+
+        # ── Step 3: Sort best signals first ─────────────────────────────
         signals.sort(key=lambda s: s.score, reverse=True)
 
         for sig in signals:
             if sig.symbol in self._order_mgr.get_open_trades():
-                continue  # already have a position in this symbol
+                continue
 
-            # Size the trade
+            snap = self._feed.get_snapshot(sig.symbol)
+            sd = self._feed.get(sig.symbol)
+
+            # ── Step 4: LLM confirmation ─────────────────────────────────
+            llm_reasoning = ""
+            if self._llm:
+                analysis = self._llm.analyze(sig.symbol, snap, sig.rationale)
+                llm_reasoning = f"[LLM:{analysis.action} conf={analysis.confidence:.2f}] "
+
+                # PASS = API error, fallback_on_error=True → let it through
+                if analysis.action == "SKIP":
+                    log_decision(
+                        self._app_logger,
+                        symbol=sig.symbol, action="SKIP",
+                        rationale=f"llm_veto: {analysis.reasoning}",
+                        market_snapshot=snap,
+                        risk_checks={
+                            "llm_action": analysis.action,
+                            "llm_confidence": analysis.confidence,
+                        },
+                    )
+                    self._storage.insert_decision(DecisionRecord(
+                        run_id=self._run_id,
+                        ts_utc=datetime.now(timezone.utc).isoformat(),
+                        ts_local=datetime.now(self._tz).isoformat(),
+                        symbol=sig.symbol, action="SKIP",
+                        rationale=f"llm_veto: {analysis.reasoning}",
+                        market_snapshot=json.dumps(snap),
+                        risk_checks=json.dumps({"llm_action": analysis.action}),
+                        params_snapshot=json.dumps(self._ol.get_params().__dict__),
+                    ))
+                    continue
+
+                if analysis.action != "PASS" and analysis.confidence < self._cfg.ai.llm_min_confidence:
+                    log_decision(
+                        self._app_logger,
+                        symbol=sig.symbol, action="SKIP",
+                        rationale=(
+                            f"llm_low_conf: {analysis.confidence:.2f} < "
+                            f"{self._cfg.ai.llm_min_confidence}  reason={analysis.reasoning}"
+                        ),
+                        market_snapshot=snap,
+                        risk_checks={"llm_confidence": analysis.confidence},
+                    )
+                    continue
+
+                # Blend LLM confidence into signal score
+                if analysis.action != "PASS":
+                    sig.score = round((sig.score + analysis.confidence) / 2.0, 4)
+
+            # ── Step 5: RL position sizing ───────────────────────────────
+            if self._rl:
+                stats = self._risk.get_daily_stats()
+                trades_today = stats.get("trades_today", 0)
+                wins = stats.get("wins_today", 0)
+                win_rate = (wins / trades_today) if trades_today > 0 else 0.5
+                daily_loss = abs(min(0.0, stats.get("realized_pnl", 0.0)))
+                drawdown_pct = daily_loss / max(1.0, self._cfg.risk.account_size_usd)
+                avg_atr_pct = self._avg_atr_pct()
+                rl_mult = self._rl.choose_multiplier(win_rate, drawdown_pct, avg_atr_pct)
+            else:
+                rl_mult = live_params.position_size_multiplier
+
+            # ── Step 6: Size trade ───────────────────────────────────────
             qty = self._risk.compute_position_size(
                 sig.entry_price,
                 sig.stop_price,
-                multiplier=live_params.position_size_multiplier,
+                multiplier=rl_mult,
             )
             if qty < 1:
                 log_decision(
                     self._app_logger,
                     symbol=sig.symbol, action="SKIP",
-                    rationale=f"qty=0 after sizing (entry={sig.entry_price:.2f} stop={sig.stop_price:.2f})",
-                    market_snapshot=sig.snapshot,
+                    rationale=(
+                        f"qty=0 after sizing (entry={sig.entry_price:.2f} "
+                        f"stop={sig.stop_price:.2f} rl_mult={rl_mult:.2f})"
+                    ),
+                    market_snapshot=snap,
                     risk_checks={"qty_check": "fail"},
                 )
                 continue
 
             sig.qty = qty
 
-            # Risk approval
+            # ── Step 7: Risk approval (hard gates — never bypassed) ──────
             approved, reason = self._risk.approve_entry(
                 sig.symbol, "BUY" if sig.action == "ENTER_LONG" else "SELL",
                 sig.entry_price, sig.stop_price, qty,
             )
-
-            snap = self._feed.get_snapshot(sig.symbol)
-            risk_checks = {"approved": approved, "reason": reason, "qty": qty}
+            risk_checks = {
+                "approved": approved,
+                "reason": reason,
+                "qty": qty,
+                "rl_mult": rl_mult,
+                "ai_score": sig.score,
+            }
 
             if not approved:
                 log_decision(
@@ -465,11 +624,13 @@ class TradingAgent:
                 ))
                 continue
 
+            # ── Submit ───────────────────────────────────────────────────
             action = sig.action
+            full_rationale = f"{llm_reasoning}{sig.rationale}"
             log_decision(
                 self._app_logger,
                 symbol=sig.symbol, action=action,
-                rationale=sig.rationale,
+                rationale=full_rationale,
                 market_snapshot=snap, risk_checks=risk_checks,
                 score=sig.score,
             )
@@ -478,22 +639,128 @@ class TradingAgent:
                 ts_utc=datetime.now(timezone.utc).isoformat(),
                 ts_local=datetime.now(self._tz).isoformat(),
                 symbol=sig.symbol, action=action,
-                rationale=sig.rationale,
+                rationale=full_rationale,
                 market_snapshot=json.dumps(snap),
                 risk_checks=json.dumps(risk_checks),
-                params_snapshot=json.dumps({"position_size_multiplier": live_params.position_size_multiplier}),
+                params_snapshot=json.dumps({
+                    "position_size_multiplier": rl_mult,
+                    "rl_sizer_active": self._rl is not None,
+                    "llm_active": self._llm is not None,
+                    "ml_active": self._ml is not None,
+                }),
             ))
 
-            self._signal_states[sig.symbol] = "LONG!" if sig.action == "ENTER_LONG" else "SHORT!"
+            self._signal_states[sig.symbol] = (
+                "LONG!" if sig.action == "ENTER_LONG" else "SHORT!"
+            )
+
+            # Store ML features so we can train after the trade closes
+            if self._ml or self._rl:
+                self._pending_features[sig.symbol] = self._build_ml_features(sig, sd)
 
             ot = await self._order_mgr.submit_bracket(sig)
             if ot:
-                logger.info("Bracket submitted for %s qty=%d", sig.symbol, qty)
+                logger.info(
+                    "Bracket submitted for %s qty=%d  score=%.3f  rl_mult=%.2f",
+                    sig.symbol, qty, sig.score, rl_mult,
+                )
             else:
                 logger.error("Bracket submission failed for %s", sig.symbol)
 
             # Only one entry per scan cycle
             break
+
+    # ------------------------------------------------------------------
+    # AI helpers
+    # ------------------------------------------------------------------
+
+    def _build_ml_features(self, sig, sd) -> dict:
+        """Build the feature vector dict for ML scoring / training."""
+        now = datetime.now(self._tz)
+        entry = sig.entry_price
+        vwap = (sd.vwap if sd and not __import__("math").isnan(sd.vwap) else entry) or entry
+        atr = (sd.atr if sd and not __import__("math").isnan(sd.atr) else 0.0) or 0.0
+        or_high = sd.or_high or entry
+        or_low = sd.or_low or entry
+        avg_vol = sd.avg_bar_volume if sd else 0
+        cur_vol = sd.current_bar_volume if sd else 0
+
+        return {
+            "vwap_dist_pct": (entry - vwap) / vwap * 100 if vwap > 0 else 0.0,
+            "rs_score": sig.snapshot.get("rs", sig.score),
+            "volume_ratio": cur_vol / avg_vol if avg_vol > 0 else 1.0,
+            "spread_bps": sd.spread_bps if sd else 0.0,
+            "atr_pct": atr / entry * 100 if entry > 0 else 0.0,
+            "or_range_pct": (or_high - or_low) / entry * 100 if entry > 0 else 0.0,
+            "hour": now.hour,
+            "minute": now.minute,
+        }
+
+    def _avg_atr_pct(self) -> float:
+        """Mean ATR% across all active watchlist symbols (for RL state)."""
+        import math
+        vals = []
+        for sym in self._cfg.watchlist.symbols:
+            sd = self._feed.get(sym)
+            if sd and not math.isnan(sd.atr) and sd.last_price > 0:
+                vals.append(sd.atr / sd.last_price)
+        return sum(vals) / len(vals) if vals else 0.01
+
+    def _update_ai_models(self) -> None:
+        """
+        Check storage for newly closed positions and update ML + RL models.
+        Called once per trading loop iteration.
+        """
+        if not self._ml and not self._rl:
+            return
+
+        try:
+            all_positions = self._storage.get_all_positions()
+        except Exception as exc:
+            logger.debug("AI model update: storage error %s", exc)
+            return
+
+        for pos in all_positions:
+            pos_id = str(pos.get("position_id", ""))
+            if not pos.get("close_ts") or pos_id in self._ai_trained_ids:
+                continue
+
+            symbol = pos.get("symbol", "")
+            features = self._pending_features.get(symbol)
+            if features is None:
+                self._ai_trained_ids.add(pos_id)
+                continue
+
+            # Compute realised R-multiple
+            entry = float(pos.get("entry_price") or 0)
+            stop = float(pos.get("stop_price") or 0)
+            qty = int(pos.get("qty") or 1)
+            pnl = float(pos.get("realized_pnl") or 0)
+            risk_per_share = abs(entry - stop)
+            r_multiple = (pnl / (risk_per_share * qty)) if risk_per_share > 0 and qty > 0 else 0.0
+            was_winner = pnl > 0
+
+            # Update ML scorer
+            if self._ml:
+                self._ml.update(features, was_winner)
+                logger.info(
+                    "ML trained on %s: %s  r=%.2fR  n=%d",
+                    symbol, "WIN" if was_winner else "LOSS",
+                    r_multiple, self._ml.n_samples,
+                )
+
+            # Update RL sizer
+            if self._rl:
+                stats = self._risk.get_daily_stats()
+                trades = stats.get("trades_today", 1)
+                wins = stats.get("wins_today", 0)
+                win_rate = wins / max(1, trades)
+                daily_loss = abs(min(0.0, stats.get("realized_pnl", 0.0)))
+                drawdown_pct = daily_loss / max(1.0, self._cfg.risk.account_size_usd)
+                self._rl.update(r_multiple, win_rate, drawdown_pct, self._avg_atr_pct())
+
+            self._ai_trained_ids.add(pos_id)
+            del self._pending_features[symbol]
 
     # ------------------------------------------------------------------
     # Helpers
@@ -669,12 +936,9 @@ def main() -> None:
     agent = TradingAgent(cfg, dry_run_override=args.dry_run)
 
     # Handle signals for graceful shutdown
-    loop = asyncio.new_event_loop()
-
     def _handle_signal(*_):
         print("\nShutdown requested …")
         agent.request_shutdown()
-        loop.call_soon_threadsafe(loop.stop)
 
     try:
         signal.signal(signal.SIGINT, _handle_signal)
@@ -683,11 +947,9 @@ def main() -> None:
         pass  # Windows doesn't support all signals
 
     try:
-        loop.run_until_complete(agent.run())
+        asyncio.run(agent.run())
     except KeyboardInterrupt:
         print("\nKeyboardInterrupt — shutting down.")
-    finally:
-        loop.close()
 
 
 if __name__ == "__main__":

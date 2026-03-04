@@ -43,7 +43,7 @@ risk:
   consecutive_loss_limit: 3          # Stop after 3 losses in a row
 
   circuit_breaker:
-    data_feed_stale_sec: 30         # No quote update in this many seconds → trip
+    data_feed_stale_sec: 60         # No quote update in this many seconds → trip (60s for delayed data)
     order_reject_count: 3           # N rejects within the window → trip
     order_reject_window_sec: 300    # Rolling window for reject counting (5 min)
     order_latency_sec: 5.0          # Round-trip order latency threshold
@@ -173,8 +173,37 @@ online_learning:
   slippage_ban_bps: 50
   spread_ban_bps: 25
 
+# ============================================================
+# AI Layer — LLM, Machine Learning, and Reinforcement Learning
+#
+# All three components are optional and degrade gracefully:
+#   llm_filter_enabled: false  → ORB rules decide without Claude
+#   ml_enabled: false          → no gradient-boosting filter
+#   rl_sizing_enabled: false   → use online_learning multiplier instead
+#
+# Set your API key:
+#   export ANTHROPIC_API_KEY=sk-ant-...
+# ============================================================
+ai:
+  enabled: true
+
+  # LLM (Claude) — second-opinion confirmation of each ORB signal
+  llm_filter_enabled: true
+  llm_model: "claude-opus-4-6"    # fastest reasoning model
+  llm_min_confidence: 0.55        # veto trade if LLM confidence < this
+  fallback_on_error: true         # if API is down, allow trade through (don't block)
+
+  # ML — gradient-boosting classifier that learns which setups win
+  ml_enabled: true
+  ml_min_probability: 0.45        # skip signal if P(win) < this (once ≥20 trades)
+
+  # RL — Q-learning agent for adaptive position sizing
+  rl_sizing_enabled: true         # replaces online_learning position_size_multiplier
+
 paths:
   db: "data/trading.db"
   log_dir: "logs"
   report_dir: "reports"
   learn_dir: "learn_output"
+  ml_model: "data/ml_model.pkl"       # gradient-boosting model (grows each session)
+  rl_qtable: "data/rl_qtable.json"    # Q-learning table (persists across restarts)

@@ -142,11 +142,25 @@ class OnlineLearningConfig:
 
 
 @dataclass
+class AIConfig:
+    enabled: bool = True
+    llm_model: str = "claude-opus-4-6"
+    llm_filter_enabled: bool = True       # require LLM confirmation before entry
+    llm_min_confidence: float = 0.55      # veto if LLM confidence < this
+    ml_enabled: bool = True               # use gradient-boosting signal scorer
+    ml_min_probability: float = 0.45     # skip if P(win) < this (once active)
+    rl_sizing_enabled: bool = True        # use Q-learning for position sizing
+    fallback_on_error: bool = True        # if AI fails, fall back to ORB rule (don't block)
+
+
+@dataclass
 class PathsConfig:
     db: str = "data/trading.db"
     log_dir: str = "logs"
     report_dir: str = "reports"
     learn_dir: str = "learn_output"
+    ml_model: str = "data/ml_model.pkl"
+    rl_qtable: str = "data/rl_qtable.json"
 
 
 @dataclass
@@ -159,6 +173,7 @@ class AppConfig:
     watchlist: WatchlistConfig
     online_learning: OnlineLearningConfig
     paths: PathsConfig
+    ai: AIConfig = field(default_factory=AIConfig)
 
 
 # ---------------------------------------------------------------------------
@@ -331,6 +346,21 @@ def load_config(path: str) -> AppConfig:
         log_dir=str(p.get("log_dir", "logs")),
         report_dir=str(p.get("report_dir", "reports")),
         learn_dir=str(p.get("learn_dir", "learn_output")),
+        ml_model=str(p.get("ml_model", "data/ml_model.pkl")),
+        rl_qtable=str(p.get("rl_qtable", "data/rl_qtable.json")),
+    )
+
+    # ---- ai ----
+    a = raw.get("ai", {})
+    ai = AIConfig(
+        enabled=bool(a.get("enabled", True)),
+        llm_model=str(a.get("llm_model", "claude-opus-4-6")),
+        llm_filter_enabled=bool(a.get("llm_filter_enabled", True)),
+        llm_min_confidence=float(a.get("llm_min_confidence", 0.55)),
+        ml_enabled=bool(a.get("ml_enabled", True)),
+        ml_min_probability=float(a.get("ml_min_probability", 0.45)),
+        rl_sizing_enabled=bool(a.get("rl_sizing_enabled", True)),
+        fallback_on_error=bool(a.get("fallback_on_error", True)),
     )
 
     # Ensure runtime directories exist
@@ -346,4 +376,5 @@ def load_config(path: str) -> AppConfig:
         watchlist=watchlist,
         online_learning=online_learning,
         paths=paths,
+        ai=ai,
     )
